@@ -1988,6 +1988,8 @@ COLUMN_BAR_DIAMETER_OPTIONS = [0.0127, 0.015875, 0.01905, 0.0381]
 COLUMN_BAR_COUNT_OPTIONS = [8, 12, 16, 20, 24, 28, 32, 36, 40]
 COLUMN_SECTION_INCREMENT = 0.05
 COLUMN_SECTION_MAX_STEPS = 20
+COLUMN_SECTION_ABSOLUTE_MAX = 2.50
+COLUMN_INTERACTION_TOLERANCE = 5e-3
 
 
 def collect_column_demand_points(column_combo_forces, combos, elements=None):
@@ -2018,9 +2020,11 @@ def design_uniform_column_section(demand_points, initial_side,
 
     step = COLUMN_SECTION_INCREMENT
     tol = 1e-6
+    ratio_tol = COLUMN_INTERACTION_TOLERANCE
     min_side = ceil_to_step(0.30, step)
     start_side = ceil_to_step(max(initial_side, min_side), step)
     max_side = start_side + step * COLUMN_SECTION_MAX_STEPS
+    absolute_max = max(start_side, COLUMN_SECTION_ABSOLUTE_MAX)
 
     bar_options = sorted(set(bar_diam_options))
     bar_counts = sorted(set(bar_count_options))
@@ -2035,6 +2039,8 @@ def design_uniform_column_section(demand_points, initial_side,
     def attempt_side(side):
         best = None
         best_metric = None
+        best_failure = None
+        best_failure_metric = None
         for n_bars in bar_counts:
             for corner_diam, face_diam in candidate_pairs:
                 try:
@@ -2062,24 +2068,42 @@ def design_uniform_column_section(demand_points, initial_side,
 
                 all_ok = True
                 max_ratio = 0.0
+                failure_ratio = 0.0
                 for point in demand_points:
                     Pu = point['Pu']
                     My = point['My']
                     Mz = point['Mz']
                     if Pu > phiPn_max + tol or Pu < phiPn_min - tol:
                         all_ok = False
+                        failure_ratio = float('inf')
                         break
                     ratio, alpha, cap_y, cap_z, ratio_y, ratio_z, _, _ = evaluate_bresler(
                         Pu, My, Mz, moment_curve_y, moment_curve_z, phiPn0_ton)
-                    if ratio > 1.0 + tol:
+                    if not np.isfinite(ratio):
                         all_ok = False
-                        break
-                    if abs(My) > cap_y * (1.0 + tol) or abs(Mz) > cap_z * (1.0 + tol):
-                        all_ok = False
+                        failure_ratio = float('inf')
                         break
                     max_ratio = max(max_ratio, ratio)
+                    if ratio > 1.0 + ratio_tol:
+                        all_ok = False
+                        failure_ratio = max(failure_ratio, ratio)
+                        break
 
                 if not all_ok:
+                    face_use = face_diam if face_diam is not None else corner_diam
+                    failure_value = failure_ratio if failure_ratio > 0.0 else max_ratio if max_ratio > 0.0 else float('inf')
+                    entry = {
+                        'side': side,
+                        'n_bars': n_bars,
+                        'bar_corners_diameter': corner_diam,
+                        'bar_faces_diameter': face_use,
+                        'As_total': As_total,
+                        'rho_long': rho_long,
+                        'failure_ratio': failure_value
+                    }
+                    if best_failure is None or failure_value < best_failure_metric:
+                        best_failure = entry
+                        best_failure_metric = failure_value
                     continue
 
                 face_use = face_diam if face_diam is not None else corner_diam
@@ -2108,26 +2132,64 @@ def design_uniform_column_section(demand_points, initial_side,
                         'rho_long': rho_long,
                         'max_ratio': max_ratio
                     }
-        return best
+        return best, best_failure
 
     # Asegurar que existe una solución a partir del tamaño inicial (permitiendo incrementos)
     side = start_side
     best_design = None
-    while side <= max_side + tol:
-        candidate = attempt_side(side)
+    best_failure = None
+    best_failure_metric = None
+    max_side_limit = min(max_side, absolute_max)
+    while side <= absolute_max + tol:
+        candidate, failure = attempt_side(side)
         if candidate is not None:
             best_design = candidate
             break
+        if failure is not None:
+            failure_value = failure.get('failure_ratio', float('inf'))
+            if not np.isfinite(failure_value):
+                failure_value = float('inf')
+            if best_failure is None or failure_value < best_failure_metric:
+                best_failure = failure
+                best_failure_metric = failure_value
         side += step
+        if side > max_side_limit + tol:
+            if max_side_limit >= absolute_max - tol:
+                break
+            max_side_limit = min(absolute_max, max_side_limit + step * COLUMN_SECTION_MAX_STEPS)
 
     if best_design is None:
-        raise RuntimeError('No se pudo encontrar una sección de columna uniforme que cumpla los requisitos.')
+        if best_failure is not None and best_failure_metric not in (None, float('inf')):
+            face_diam = best_failure['bar_faces_diameter']
+            corner_diam = best_failure['bar_corners_diameter']
+            face_label = bar_diameter_label(face_diam)
+            corner_label = bar_diameter_label(corner_diam)
+            if abs(face_diam - corner_diam) <= 1e-6:
+                bar_descr = f"{best_failure['n_bars']}Ø{face_label}"
+            else:
+                bar_descr = (f"{best_failure['n_bars']} barras (esquinas Ø{corner_label}, "
+                             f"caras Ø{face_label})")
+            msg_detail = (
+                f"Intento más cercano: sección {best_failure['side']:.2f}×{best_failure['side']:.2f} m con {bar_descr} "
+                f"(ρ={best_failure['rho_long']*100:.2f}%). Índice Bresler={best_failure_metric:.3f}."
+            )
+        else:
+            msg_detail = 'No se encontraron combinaciones factibles de sección y refuerzo.'
+        raise RuntimeError('No se pudo encontrar una sección de columna uniforme que cumpla los requisitos. '
+                           + msg_detail)
 
     # Intentar reducir progresivamente la sección hasta alcanzar el mínimo que cumple
     next_side = floor_to_step(best_design['side'] - step, step)
     while next_side >= min_side - tol:
-        candidate = attempt_side(next_side)
+        candidate, failure = attempt_side(next_side)
         if candidate is None:
+            if failure is not None:
+                failure_value = failure.get('failure_ratio', float('inf'))
+                if not np.isfinite(failure_value):
+                    failure_value = float('inf')
+                if best_failure is None or failure_value < best_failure_metric:
+                    best_failure = failure
+                    best_failure_metric = failure_value
             break
         best_design = candidate
         next_side = floor_to_step(candidate['side'] - step, step)
